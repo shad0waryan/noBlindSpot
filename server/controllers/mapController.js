@@ -1,46 +1,59 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { v4 as uuidv4 } from "uuid";
 import TopicMap from "../models/TopicMap.js";
+import UserProgress from "../models/UserProgress.js";
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// Build the prompt for Claude to generate a knowledge map
 const buildKnowledgeMapPrompt = (topic) => `
 You are an expert educator and curriculum designer. A student wants to learn about: "${topic}"
 
-Your task is to generate a comprehensive knowledge map — a complete tree of ALL concepts, sub-topics, and skills that someone must understand to have full mastery of this topic.
+Your task is to generate a comprehensive knowledge map — a complete tree of ALL concepts required for mastery.
 
-Rules:
-- Cover the FULL territory of the topic, including areas beginners commonly miss
-- Organize into a tree: root topic → main areas → sub-topics → specific concepts
-- Maximum depth: 4 levels
-- Each node should be atomic (one clear concept)
-- Be exhaustive — the goal is to reveal blind spots the learner doesn't even know exist
-- Do NOT include learning resources or tips — only the knowledge map itself
+STRICT RULES:
+- Cover FULL topic
+- Max depth: 4
+- Each node atomic
+- EXACTLY ONE root node
+- All parentIds must exist
+- IDs must be unique
+- NO duplicate labels
+- Return ONLY valid JSON array
 
-Respond with ONLY a valid JSON array. No explanation, no markdown, no backticks.
-
-JSON format:
+Format:
 [
   {
-    "id": "unique-string-id",
-    "label": "Concept Name",
-    "description": "One sentence explaining what this concept covers",
+    "id": "unique-id",
+    "label": "Concept",
+    "description": "Short explanation",
     "parentId": null,
     "depth": 0
-  },
-  ...
+  }
 ]
-
-The root node has parentId: null and depth: 0.
-Children have parentId set to their parent's id.
-Depth increments by 1 per level.
-Generate between 30 and 60 nodes total for a thorough map.
 `;
 
-// @desc    Generate AI knowledge map for a topic
-// @route   POST /api/maps/generate
-// @access  Private
+function validateTree(nodes) {
+  const ids = new Set();
+  const parentIds = new Set();
+
+  nodes.forEach((n) => {
+    ids.add(n.id);
+    if (n.parentId) parentIds.add(n.parentId);
+  });
+
+  for (let pid of parentIds) {
+    if (!ids.has(pid)) {
+      throw new Error("Invalid AI response: parentId does not exist");
+    }
+  }
+
+  const roots = nodes.filter((n) => n.parentId === null);
+  if (roots.length !== 1) {
+    throw new Error("Invalid AI response: must have exactly one root node");
+  }
+}
+
+// ===================== GENERATE MAP =====================
 export const generateMap = async (req, res, next) => {
   try {
     const { topic } = req.body;
@@ -50,48 +63,77 @@ export const generateMap = async (req, res, next) => {
     }
 
     if (topic.trim().length > 200) {
-      return res
-        .status(400)
-        .json({ message: "Topic is too long (max 200 chars)" });
+      return res.status(400).json({ message: "Topic too long" });
     }
 
-    // Call Claude API
+    const normalizedTopic = topic.trim().toLowerCase();
+
+    let topicMap = await TopicMap.findOne({ topic: normalizedTopic });
+
+    // ================= CACHE HIT =================
+    if (topicMap) {
+      let progress = await UserProgress.findOne({
+        user: req.user._id,
+        topicMap: topicMap._id,
+      });
+
+      if (!progress) {
+        progress = await UserProgress.create({
+          user: req.user._id,
+          topicMap: topicMap._id,
+          nodeStatuses: {},
+          stats: {
+            total: topicMap.nodes.length,
+            known: 0,
+            partial: 0,
+            unknown: topicMap.nodes.length,
+          },
+        });
+      }
+
+      return res.json({ topicMap, progress, cached: true });
+    }
+
+    // ================= AI CALL =================
     const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+
     const result = await model.generateContent(
-      buildKnowledgeMapPrompt(topic.trim()),
+      buildKnowledgeMapPrompt(normalizedTopic),
     );
+
     const rawText = result.response.text().trim();
 
-    // Parse JSON response
     let nodes;
     try {
       nodes = JSON.parse(rawText);
     } catch {
-      // Try to extract JSON array if Claude added any extra text
-      const jsonMatch = rawText.match(/\[[\s\S]*\]/);
-      if (!jsonMatch) {
-        return res
-          .status(500)
-          .json({ message: "Failed to parse AI response. Please try again." });
+      const match = rawText.match(/\[[\s\S]*\]/);
+      if (!match) {
+        return res.status(500).json({ message: "AI parse failed" });
       }
-      nodes = JSON.parse(jsonMatch[0]);
+      nodes = JSON.parse(match[0]);
     }
 
-    // Sanitize nodes — ensure all required fields exist
     const sanitizedNodes = nodes.map((node) => ({
       id: node.id || uuidv4(),
-      label: node.label || "Unnamed Concept",
+      label: node.label || "Unnamed",
       description: node.description || "",
       parentId: node.parentId ?? null,
       depth: node.depth ?? 0,
-      status: "unknown",
     }));
 
-    // Save to DB
-    const topicMap = await TopicMap.create({
-      user: req.user._id,
-      topic: topic.trim(),
+    validateTree(sanitizedNodes);
+
+    // ================= SAVE MAP =================
+    topicMap = await TopicMap.create({
+      topic: normalizedTopic,
       nodes: sanitizedNodes,
+    });
+
+    const progress = await UserProgress.create({
+      user: req.user._id,
+      topicMap: topicMap._id,
+      nodeStatuses: {},
       stats: {
         total: sanitizedNodes.length,
         known: 0,
@@ -100,112 +142,99 @@ export const generateMap = async (req, res, next) => {
       },
     });
 
-    res.status(201).json({ topicMap });
-  } catch (error) {
-    next(error);
+    res.status(201).json({ topicMap, progress });
+  } catch (err) {
+    next(err);
   }
 };
 
-// @desc    Get all topic maps for logged-in user
-// @route   GET /api/maps
-// @access  Private
+// ================= GET ALL =================
 export const getMaps = async (req, res, next) => {
   try {
-    const maps = await TopicMap.find({ user: req.user._id })
-      .select("topic stats createdAt updatedAt")
+    const progress = await UserProgress.find({ user: req.user._id })
+      .populate("topicMap", "topic")
       .sort({ updatedAt: -1 });
 
-    res.json({ maps });
-  } catch (error) {
-    next(error);
+    res.json({ progress });
+  } catch (err) {
+    next(err);
   }
 };
 
-// @desc    Get a single topic map by ID
-// @route   GET /api/maps/:id
-// @access  Private
+// ================= GET SINGLE =================
 export const getMapById = async (req, res, next) => {
   try {
-    const map = await TopicMap.findOne({
-      _id: req.params.id,
-      user: req.user._id,
-    });
+    const topicMap = await TopicMap.findById(req.params.id);
 
-    if (!map) {
-      return res.status(404).json({ message: "Topic map not found" });
+    if (!topicMap) {
+      return res.status(404).json({ message: "Map not found" });
     }
 
-    res.json({ topicMap: map });
-  } catch (error) {
-    next(error);
+    const progress = await UserProgress.findOne({
+      user: req.user._id,
+      topicMap: topicMap._id,
+    });
+
+    res.json({ topicMap, progress });
+  } catch (err) {
+    next(err);
   }
 };
 
-// @desc    Update node statuses (self-assessment save)
-// @route   PATCH /api/maps/:id/nodes
-// @access  Private
+// ================= UPDATE NODES =================
 export const updateNodes = async (req, res, next) => {
   try {
-    const { nodes } = req.body; // array of { id, status }
+    const { nodes } = req.body;
 
-    if (!Array.isArray(nodes)) {
-      return res.status(400).json({ message: "nodes must be an array" });
-    }
-
-    const map = await TopicMap.findOne({
-      _id: req.params.id,
+    const progress = await UserProgress.findOne({
       user: req.user._id,
+      topicMap: req.params.id,
     });
 
-    if (!map) {
-      return res.status(404).json({ message: "Topic map not found" });
+    if (!progress) {
+      return res.status(404).json({ message: "Progress not found" });
     }
 
-    // Build a status lookup map
-    const statusUpdate = {};
     nodes.forEach(({ id, status }) => {
       if (["unknown", "partial", "known"].includes(status)) {
-        statusUpdate[id] = status;
+        progress.nodeStatuses.set(id, status);
       }
     });
 
-    // Apply updates
-    map.nodes = map.nodes.map((node) => {
-      if (statusUpdate[node.id] !== undefined) {
-        node.status = statusUpdate[node.id];
-      }
-      return node;
+    const topicMap = await TopicMap.findById(req.params.id);
+
+    const stats = { total: 0, known: 0, partial: 0, unknown: 0 };
+
+    topicMap.nodes.forEach((node) => {
+      const status = progress.nodeStatuses.get(node.id) || "unknown";
+      stats.total++;
+      stats[status]++;
     });
 
-    // Recalculate stats
-    const stats = { total: map.nodes.length, known: 0, partial: 0, unknown: 0 };
-    map.nodes.forEach((n) => stats[n.status]++);
-    map.stats = stats;
+    progress.stats = stats;
 
-    await map.save();
+    await progress.save();
 
-    res.json({ topicMap: map });
-  } catch (error) {
-    next(error);
+    res.json({ progress });
+  } catch (err) {
+    next(err);
   }
 };
 
-// @desc    Delete a topic map
-// @route   DELETE /api/maps/:id
-// @access  Private
+// ================= DELETE =================
 export const deleteMap = async (req, res, next) => {
   try {
-    const map = await TopicMap.findOneAndDelete({
-      _id: req.params.id,
+    const progress = await UserProgress.findOneAndDelete({
       user: req.user._id,
+      topicMap: req.params.id,
     });
 
-    if (!map) {
-      return res.status(404).json({ message: "Topic map not found" });
+    if (!progress) {
+      return res.status(404).json({ message: "Not found" });
     }
 
-    res.json({ message: "Topic map deleted successfully" });
-  } catch (error) {
-    next(error);
+    res.json({ message: "Progress deleted" });
+  } catch (err) {
+    next(err);
   }
 };
