@@ -6,19 +6,17 @@ import UserProgress from "../models/UserProgress.js";
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 const buildKnowledgeMapPrompt = (topic) => `
-You are an expert educator and curriculum designer. A student wants to learn about: "${topic}"
+You are an expert educator and curriculum designer. Topic: "${topic}"
 
-Your task is to generate a comprehensive knowledge map — a complete tree of ALL concepts required for mastery.
+Generate a complete knowledge map.
 
 STRICT RULES:
-- Cover FULL topic
-- Max depth: 4
-- Each node atomic
-- EXACTLY ONE root node
-- All parentIds must exist
+- EXACTLY ONE root
+- Max depth 4
 - IDs must be unique
-- NO duplicate labels
-- Return ONLY valid JSON array
+- parentId must exist
+- No duplicates
+- Return ONLY JSON array
 
 Format:
 [
@@ -37,23 +35,27 @@ function validateTree(nodes) {
   const parentIds = new Set();
 
   nodes.forEach((n) => {
+    if (ids.has(n.id)) {
+      throw new Error("Duplicate node ID found");
+    }
     ids.add(n.id);
+
     if (n.parentId) parentIds.add(n.parentId);
   });
 
   for (let pid of parentIds) {
     if (!ids.has(pid)) {
-      throw new Error("Invalid AI response: parentId does not exist");
+      throw new Error("Invalid parentId");
     }
   }
 
   const roots = nodes.filter((n) => n.parentId === null);
   if (roots.length !== 1) {
-    throw new Error("Invalid AI response: must have exactly one root node");
+    throw new Error("Must have exactly one root");
   }
 }
 
-// ===================== GENERATE MAP =====================
+// ================= GENERATE =================
 export const generateMap = async (req, res, next) => {
   try {
     const { topic } = req.body;
@@ -70,7 +72,7 @@ export const generateMap = async (req, res, next) => {
 
     let topicMap = await TopicMap.findOne({ topic: normalizedTopic });
 
-    // ================= CACHE HIT =================
+    // ===== CACHE =====
     if (topicMap) {
       let progress = await UserProgress.findOne({
         user: req.user._id,
@@ -94,7 +96,7 @@ export const generateMap = async (req, res, next) => {
       return res.json({ topicMap, progress, cached: true });
     }
 
-    // ================= AI CALL =================
+    // ===== AI CALL =====
     const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
     const result = await model.generateContent(
@@ -114,6 +116,11 @@ export const generateMap = async (req, res, next) => {
       nodes = JSON.parse(match[0]);
     }
 
+    // 🔴 prevent empty response
+    if (!Array.isArray(nodes) || nodes.length === 0) {
+      return res.status(500).json({ message: "AI returned empty map" });
+    }
+
     const sanitizedNodes = nodes.map((node) => ({
       id: node.id || uuidv4(),
       label: node.label || "Unnamed",
@@ -124,7 +131,7 @@ export const generateMap = async (req, res, next) => {
 
     validateTree(sanitizedNodes);
 
-    // ================= SAVE MAP =================
+    // ===== SAVE MAP =====
     topicMap = await TopicMap.create({
       topic: normalizedTopic,
       nodes: sanitizedNodes,
@@ -161,7 +168,7 @@ export const getMaps = async (req, res, next) => {
   }
 };
 
-// ================= GET SINGLE =================
+// ================= GET ONE =================
 export const getMapById = async (req, res, next) => {
   try {
     const topicMap = await TopicMap.findById(req.params.id);
@@ -181,7 +188,7 @@ export const getMapById = async (req, res, next) => {
   }
 };
 
-// ================= UPDATE NODES =================
+// ================= UPDATE =================
 export const updateNodes = async (req, res, next) => {
   try {
     const { nodes } = req.body;
@@ -195,7 +202,11 @@ export const updateNodes = async (req, res, next) => {
       return res.status(404).json({ message: "Progress not found" });
     }
 
-    nodes.forEach(({ id, status }) => {
+    nodes.forEach((item) => {
+      if (!item || !item.id) return;
+
+      const { id, status } = item;
+
       if (["unknown", "partial", "known"].includes(status)) {
         progress.nodeStatuses.set(id, status);
       }

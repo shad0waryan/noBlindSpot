@@ -16,7 +16,8 @@ const topicMapSchema = new mongoose.Schema(
     topic: {
       type: String,
       required: true,
-      unique: true, // IMPORTANT for caching
+      unique: true,
+      index: true, // 🔥 added for performance
     },
     nodes: [nodeSchema],
   },

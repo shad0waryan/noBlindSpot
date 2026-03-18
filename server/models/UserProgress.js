@@ -14,7 +14,7 @@ const userProgressSchema = new mongoose.Schema(
     },
     nodeStatuses: {
       type: Map,
-      of: String, // "unknown" | "partial" | "known"
+      of: String,
       default: {},
     },
     stats: {
@@ -24,7 +24,9 @@ const userProgressSchema = new mongoose.Schema(
       unknown: Number,
     },
   },
-  { timestamps: true },
+  { timestamps: true }
 );
+
+userProgressSchema.index({ user: 1, topicMap: 1 }, { unique: true });
 
 export default mongoose.model("UserProgress", userProgressSchema);
