@@ -13,7 +13,7 @@ const Navbar = () => {
 
   return (
     <nav className="border-b border-surface-border bg-surface/80 backdrop-blur-md sticky top-0 z-50">
-      <div className="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
+      <div className="max-w-screen mx-auto px-20 h-16 flex items-center justify-between">
         {/* Logo */}
         <Link to="/dashboard" className="flex items-center gap-2.5 group">
           <div className="w-8 h-8 rounded-lg bg-brand-500/20 border border-brand-500/30 flex items-center justify-center group-hover:bg-brand-500/30 transition-colors">
@@ -29,7 +29,7 @@ const Navbar = () => {
         {/* Right side */}
         {user && (
           <div className="flex items-center gap-3">
-            <span className="text-sm text-slate-400 font-body hidden sm:block">
+            <span className="text-sm text-white font-bold capitalize font-body hidden sm:block">
               {user.name}
             </span>
             <button onClick={handleLogout} className="btn-ghost text-sm py-2 px-4">

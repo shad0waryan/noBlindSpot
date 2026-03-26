@@ -1,29 +1,25 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { mapsAPI } from "../services/api";
-import { Spinner, Alert, ProgressBar, StatusBadge } from "../components/ui";
+import { Spinner, Alert, ProgressBar } from "../components/ui";
+import dagre from "dagre";
 
-const STATUS_CYCLE = ["unknown", "partial", "known"];
+import ReactFlow, { Background, Controls } from "reactflow";
+import "reactflow/dist/style.css";
 
-const STATUS_STYLES = {
-  unknown: "border-slate-700 bg-surface-card hover:border-slate-500",
-  partial: "border-amber-500/40 bg-amber-500/5 hover:border-amber-500/60",
-  known:   "border-emerald-500/40 bg-emerald-500/5 hover:border-emerald-500/60",
-};
+const STATUSES = ["unknown", "partial", "known"];
 
 const MapView = () => {
-  const { id }   = useParams();
+  const { id } = useParams();
   const navigate = useNavigate();
 
-  const [topicMap, setTopicMap]   = useState(null);
-  const [nodes,    setNodes]      = useState([]);
-  const [loading,  setLoading]    = useState(true);
-  const [saving,   setSaving]     = useState(false);
-  const [saved,    setSaved]      = useState(false);
-  const [error,    setError]      = useState("");
-  const [filter,   setFilter]     = useState("all"); // all | unknown | partial | known
-  const [search,   setSearch]     = useState("");
-  const [expanded, setExpanded]   = useState({}); // track which depth-0/1 nodes are collapsed
+  const [topicMap, setTopicMap] = useState(null);
+  const [nodes, setNodes] = useState([]);
+  const [progress, setProgress] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [viewMode, setViewMode] = useState("list"); // list | tree | graph
 
   useEffect(() => {
     fetchMap();
@@ -34,287 +30,354 @@ const MapView = () => {
       const { data } = await mapsAPI.getById(id);
       setTopicMap(data.topicMap);
       setNodes(data.topicMap.nodes);
+      setProgress(data.progress);
     } catch {
-      setError("Failed to load map.");
+      setError("Failed to load map");
     } finally {
       setLoading(false);
     }
   };
 
-  // Cycle through unknown → partial → known → unknown
-  const cycleStatus = (nodeId) => {
-    setSaved(false);
-    setNodes((prev) =>
-      prev.map((n) => {
-        if (n.id !== nodeId) return n;
-        const next = STATUS_CYCLE[(STATUS_CYCLE.indexOf(n.status) + 1) % STATUS_CYCLE.length];
-        return { ...n, status: next };
-      })
-    );
+  // 🔥 UPDATE STATUS
+  const updateStatus = (nodeId, status) => {
+    setProgress((prev) => ({
+      ...prev,
+      nodeStatuses: {
+        ...prev.nodeStatuses,
+        [nodeId]: status,
+      },
+    }));
   };
 
-  const handleSave = async () => {
-    setSaving(true);
-    setError("");
-    try {
-      const payload = nodes.map(({ id, status }) => ({ id, status }));
-      const { data } = await mapsAPI.updateNodes(id, payload);
-      setTopicMap(data.topicMap);
-      setSaved(true);
-      setTimeout(() => setSaved(false), 2500);
-    } catch {
-      setError("Failed to save progress.");
-    } finally {
-      setSaving(false);
-    }
+  // 🔥 AUTO SAVE
+  useEffect(() => {
+    if (!progress) return;
+
+    const timeout = setTimeout(async () => {
+      try {
+        setSaving(true);
+
+        const payload = Object.entries(progress.nodeStatuses || {}).map(
+          ([nodeId, status]) => ({ id: nodeId, status }),
+        );
+
+        await mapsAPI.updateNodes(id, payload);
+      } catch {
+        setError("Failed to save progress");
+      } finally {
+        setSaving(false);
+      }
+    }, 800);
+
+    return () => clearTimeout(timeout);
+  }, [progress]);
+
+  // 🔥 DELETE
+  const handleDelete = async () => {
+    if (!confirm("Delete this map?")) return;
+    await mapsAPI.delete(id);
+    navigate("/dashboard");
   };
 
-  // Build tree structure
-  const buildTree = useCallback(() => {
-    const nodeMap = {};
-    nodes.forEach((n) => { nodeMap[n.id] = { ...n, children: [] }; });
-    const roots = [];
-    nodes.forEach((n) => {
-      if (n.parentId === null) roots.push(nodeMap[n.id]);
-      else if (nodeMap[n.parentId]) nodeMap[n.parentId].children.push(nodeMap[n.id]);
-    });
-    return roots;
-  }, [nodes]);
-
+  // 🔥 STATS
   const computeStats = () => {
-    const total   = nodes.length;
-    const known   = nodes.filter((n) => n.status === "known").length;
-    const partial = nodes.filter((n) => n.status === "partial").length;
-    const unknown = nodes.filter((n) => n.status === "unknown").length;
-    return { total, known, partial, unknown };
+    let known = 0,
+      partial = 0,
+      unknown = 0;
+
+    nodes.forEach((n) => {
+      const status = progress?.nodeStatuses?.[n.id] || "unknown";
+      if (status === "known") known++;
+      else if (status === "partial") partial++;
+      else unknown++;
+    });
+
+    return { total: nodes.length, known, partial, unknown };
   };
 
-  // Flat filtered list for search/filter mode
-  const filteredNodes = nodes.filter((n) => {
-    const matchFilter = filter === "all" || n.status === filter;
-    const matchSearch = n.label.toLowerCase().includes(search.toLowerCase()) ||
-                        n.description.toLowerCase().includes(search.toLowerCase());
-    return matchFilter && matchSearch;
-  });
+  // 🔥 TREE BUILD
+  const buildTree = () => {
+    const map = {};
+    const roots = [];
 
-  const isSearching = search.trim().length > 0 || filter !== "all";
+    nodes.forEach((n) => {
+      map[n.id] = { ...n, children: [] };
+    });
 
-  const toggleExpand = (nodeId) =>
-    setExpanded((prev) => ({ ...prev, [nodeId]: !prev[nodeId] }));
+    nodes.forEach((n) => {
+      if (n.parentId === null) roots.push(map[n.id]);
+      else if (map[n.parentId]) map[n.parentId].children.push(map[n.id]);
+    });
 
-  // Recursive tree renderer
+    return roots;
+  };
+
+  // 🔥 TREE RENDER
   const renderTree = (treeNodes, depth = 0) => {
     return treeNodes.map((node) => {
-      const isCollapsed = expanded[node.id] === true; // default expanded
-      const hasChildren = node.children?.length > 0;
-      const indent = depth * 20;
+      const status = progress.nodeStatuses?.[node.id] || "unknown";
 
       return (
         <div key={node.id}>
           <div
-            className={`flex items-start gap-3 p-3 rounded-xl border transition-all duration-150 cursor-pointer mb-1.5 ${STATUS_STYLES[node.status]}`}
-            style={{ marginLeft: `${indent}px` }}
-            onClick={() => cycleStatus(node.id)}
+            className={`p-4 rounded-xl border mb-2 ${
+              status === "known"
+                ? "border-emerald-500/30 bg-emerald-500/5"
+                : status === "partial"
+                  ? "border-amber-500/30 bg-amber-500/5"
+                  : "border-slate-700 bg-slate-800"
+            }`}
+            style={{ marginLeft: `${depth * 24}px` }}
           >
-            {/* Expand/collapse for parent nodes */}
-            {hasChildren && (
-              <button
-                onClick={(e) => { e.stopPropagation(); toggleExpand(node.id); }}
-                className="mt-0.5 text-slate-500 hover:text-slate-300 transition-colors shrink-0"
-              >
-                <svg
-                  className={`w-3.5 h-3.5 transition-transform ${isCollapsed ? "-rotate-90" : ""}`}
-                  fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
-                >
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
-                </svg>
-              </button>
-            )}
-            {!hasChildren && <div className="w-3.5 shrink-0" />}
+            <div className="text-white font-medium">{node.label}</div>
 
-            <div className="flex-1 min-w-0">
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className={`font-display font-medium text-sm ${
-                  node.status === "known"   ? "text-emerald-300" :
-                  node.status === "partial" ? "text-amber-300"   : "text-slate-200"
-                }`}>
-                  {node.label}
-                </span>
-                <StatusBadge status={node.status} />
-              </div>
-              {node.description && (
-                <p className="text-xs text-slate-500 font-body mt-0.5 leading-relaxed">
-                  {node.description}
-                </p>
-              )}
+            <div className="flex gap-2 mt-2">
+              {STATUSES.map((s) => (
+                <button
+                  key={s}
+                  onClick={() => updateStatus(node.id, s)}
+                  className={`px-2 py-1 text-xs rounded border ${
+                    status === s
+                      ? "bg-brand-500/20 text-white border-brand-500"
+                      : "border-slate-600 text-slate-400"
+                  }`}
+                >
+                  {s}
+                </button>
+              ))}
             </div>
           </div>
 
-          {/* Children */}
-          {hasChildren && !isCollapsed && (
-            <div>{renderTree(node.children, depth + 1)}</div>
-          )}
+          {node.children.length > 0 && renderTree(node.children, depth + 1)}
         </div>
       );
     });
   };
 
-  if (loading) {
-    return (
-      <div className="min-h-screen flex items-center justify-center">
-        <div className="text-center space-y-3">
-          <Spinner size="lg" />
-          <p className="text-slate-400 font-body text-sm">Loading your map...</p>
-        </div>
-      </div>
-    );
-  }
+  // 🔥 GRAPH BUILD
 
-  if (error && !topicMap) {
-    return (
-      <div className="max-w-2xl mx-auto px-6 py-20 text-center">
-        <Alert type="error" message={error} />
-        <button onClick={() => navigate("/dashboard")} className="btn-ghost mt-4">
-          ← Back to Dashboard
-        </button>
-      </div>
-    );
-  }
+  const buildGraph = () => {
+    const g = new dagre.graphlib.Graph();
+    g.setDefaultEdgeLabel(() => ({}));
+
+    g.setGraph({
+      rankdir: "TB", // 🔥 Top to Bottom (change to LR if you want)
+      nodesep: 80,
+      ranksep: 120,
+    });
+
+    // Add nodes
+    nodes.forEach((node) => {
+      g.setNode(node.id, { width: 160, height: 50 });
+    });
+
+    // Add edges
+    nodes.forEach((node) => {
+      if (node.parentId) {
+        g.setEdge(node.parentId, node.id);
+      }
+    });
+
+    // Compute layout
+    dagre.layout(g);
+
+    const graphNodes = nodes.map((node) => {
+      const pos = g.node(node.id);
+      const status = progress.nodeStatuses?.[node.id] || "unknown";
+
+      return {
+        id: node.id,
+        data: { label: node.label },
+        position: {
+          x: pos.x,
+          y: pos.y,
+        },
+        style: {
+          padding: 10,
+          borderRadius: 8,
+          border:
+            status === "known"
+              ? "2px solid #10b981"
+              : status === "partial"
+                ? "2px solid #f59e0b"
+                : "2px solid #475569",
+          background:
+            status === "known"
+              ? "#022c22"
+              : status === "partial"
+                ? "#3b2f05"
+                : "#0f172a",
+          color: "white",
+          fontSize: "12px",
+        },
+      };
+    });
+
+    const graphEdges = nodes
+      .filter((n) => n.parentId)
+      .map((n) => ({
+        id: `${n.parentId}-${n.id}`,
+        source: n.parentId,
+        target: n.id,
+        animated: false,
+      }));
+
+    return { graphNodes, graphEdges };
+  };
+
+  if (loading || !progress) return <Spinner />;
 
   const stats = computeStats();
-  const tree  = buildTree();
+  const { graphNodes, graphEdges } = buildGraph();
 
   return (
-    <div className="max-w-4xl mx-auto px-6 py-8">
-      {/* Header */}
-      <div className="mb-6 animate-fade-in">
-        <button
-          onClick={() => navigate("/dashboard")}
-          className="text-slate-500 hover:text-slate-300 text-sm font-body flex items-center gap-1 mb-4 transition-colors"
-        >
-          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
-          </svg>
-          Dashboard
-        </button>
-
-        <div className="flex items-start justify-between gap-4 flex-wrap">
-          <div>
-            <h1 className="font-display font-bold text-2xl text-white mb-1">
-              {topicMap?.topic}
-            </h1>
-            <p className="text-slate-400 font-body text-sm">
-              Click any concept to cycle: Unknown → Partial → Known
-            </p>
-          </div>
+    <div className="w-full h-screen flex flex-col p-20">
+      {/* HEADER */}
+      <div className="mb-8">
+        {/* ROW 1 → BACK */}
+        <div className="mb-4">
           <button
-            onClick={handleSave}
-            disabled={saving}
-            className={`btn-primary flex items-center gap-2 ${saved ? "bg-emerald-500 hover:bg-emerald-400" : ""}`}
+            onClick={() => navigate("/dashboard")}
+            className="group flex items-center gap-2 px-4 py-2 rounded-xl 
+             border border-slate-700 bg-slate-900/40 text-slate-300
+             hover:border-slate-500 hover:bg-slate-800/60 hover:text-white
+             active:scale-95
+             transition-all duration-200 backdrop-blur-sm shadow-sm"
           >
-            {saving ? (
-              <><Spinner size="sm" /> Saving...</>
-            ) : saved ? (
-              <>
-                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-                </svg>
-                Saved!
-              </>
-            ) : (
-              <>
-                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4" />
-                </svg>
-                Save Progress
-              </>
-            )}
+            <span className="inline-block transform transition-transform duration-200 group-hover:-translate-x-1">
+              ←
+            </span>
+            <span className="font-medium">Back</span>
+          </button>
+        </div>
+
+        {/* ROW 2 → TITLE CENTER */}
+        <div className="text-center mb-6">
+          <h1 className="text-3xl font-semibold text-white capitalize">
+            {topicMap.topic}
+          </h1>
+        </div>
+
+        {/* ROW 3 → LEFT + RIGHT */}
+        <div className="flex justify-between items-center">
+          {/* LEFT → VIEW MODES */}
+          <div className="flex gap-2">
+            {["list", "tree", "graph"].map((mode) => (
+              <button
+                key={mode}
+                onClick={() => setViewMode(mode)}
+                className={`px-4 py-1.5 rounded-lg border text-sm capitalize transition ${
+                  viewMode === mode
+                    ? "border-brand-500 text-white bg-brand-500/10"
+                    : "border-slate-600 text-slate-400 hover:border-slate-400"
+                }`}
+              >
+                {mode}
+              </button>
+            ))}
+          </div>
+
+          {/* RIGHT → DELETE */}
+          <button
+            onClick={handleDelete}
+            className="px-4 py-1.5 rounded-lg border border-red-500/40 text-red-400 
+                 hover:bg-red-500/10 hover:border-red-400 hover:text-red-300 
+                 transition-all duration-200 text-sm font-medium"
+          >
+            Delete Map
           </button>
         </div>
       </div>
+      <Alert type="error" message={error} />
 
-      {/* Stats */}
-      <div className="card p-5 mb-6 animate-slide-up">
-        <ProgressBar known={stats.known} partial={stats.partial} total={stats.total} />
-        <div className="grid grid-cols-3 gap-3 mt-4">
-          {[
-            { label: "Known",   count: stats.known,   color: "text-emerald-400", bg: "bg-emerald-500/10 border-emerald-500/20" },
-            { label: "Partial", count: stats.partial, color: "text-amber-400",   bg: "bg-amber-500/10 border-amber-500/20" },
-            { label: "Unknown", count: stats.unknown, color: "text-slate-400",   bg: "bg-slate-800 border-slate-700" },
-          ].map(({ label, count, color, bg }) => (
-            <div key={label} className={`rounded-xl border px-4 py-3 text-center ${bg}`}>
-              <div className={`font-display font-bold text-2xl ${color}`}>{count}</div>
-              <div className="text-xs text-slate-500 font-body mt-0.5">{label}</div>
-            </div>
-          ))}
-        </div>
+      {/* PROGRESS */}
+      <ProgressBar
+        known={stats.known}
+        partial={stats.partial}
+        total={stats.total}
+      />
+
+      {/* SAVE INDICATOR */}
+      <div className="text-xs text-slate-500 mt-2 mb-4">
+        {saving ? "Saving..." : "Saved"}
       </div>
 
-      {/* Search + Filter */}
-      <div className="flex gap-3 mb-4 flex-wrap animate-fade-in">
-        <input
-          type="text"
-          className="input flex-1 min-w-48 py-2"
-          placeholder="Search concepts..."
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-        />
-        <div className="flex gap-2">
-          {["all", "unknown", "partial", "known"].map((f) => (
-            <button
-              key={f}
-              onClick={() => setFilter(f)}
-              className={`text-xs font-display font-medium px-3 py-2 rounded-lg border transition-all duration-150 capitalize ${
-                filter === f
-                  ? "bg-brand-500/20 border-brand-500/40 text-brand-300"
-                  : "bg-surface-card border-surface-border text-slate-400 hover:border-slate-600"
-              }`}
-            >
-              {f}
-            </button>
-          ))}
-        </div>
-      </div>
+      {/* CONTENT */}
+      {viewMode === "list" && (
+        <div className="space-y-3 overflow-y-auto pr-2">
+          {nodes.map((node) => {
+            const status = progress.nodeStatuses?.[node.id] || "unknown";
 
-      {error && <Alert type="error" message={error} />}
+            return (
+              <div
+                key={node.id}
+                className={`p-4 rounded-xl border transition-all duration-200 hover:border-slate-500 ${
+                  status === "known"
+                    ? "border-emerald-500/30 bg-emerald-500/5"
+                    : status === "partial"
+                      ? "border-amber-500/30 bg-amber-500/5"
+                      : "border-slate-700 bg-slate-800"
+                }`}
+              >
+                {/* TITLE */}
+                <div className="flex items-center justify-between">
+                  <h3 className="text-white font-medium">{node.label}</h3>
 
-      {/* Node tree / filtered list */}
-      <div className="animate-fade-in">
-        {isSearching ? (
-          filteredNodes.length === 0 ? (
-            <div className="text-center py-12 text-slate-500 font-body">
-              No concepts match your filter.
-            </div>
-          ) : (
-            <div>
-              {filteredNodes.map((node) => (
-                <div
-                  key={node.id}
-                  className={`flex items-start gap-3 p-3 rounded-xl border transition-all duration-150 cursor-pointer mb-1.5 ${STATUS_STYLES[node.status]}`}
-                  onClick={() => cycleStatus(node.id)}
-                >
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <span className={`font-display font-medium text-sm ${
-                        node.status === "known"   ? "text-emerald-300" :
-                        node.status === "partial" ? "text-amber-300"   : "text-slate-200"
-                      }`}>
-                        {node.label}
-                      </span>
-                      <StatusBadge status={node.status} />
-                    </div>
-                    {node.description && (
-                      <p className="text-xs text-slate-500 font-body mt-0.5">{node.description}</p>
-                    )}
-                  </div>
+                  {/* STATUS BADGE */}
+                  <span
+                    className={`text-xs px-2 py-0.5 rounded-full capitalize ${
+                      status === "known"
+                        ? "bg-emerald-500/20 text-emerald-300"
+                        : status === "partial"
+                          ? "bg-amber-500/20 text-amber-300"
+                          : "bg-slate-700 text-slate-400"
+                    }`}
+                  >
+                    {status}
+                  </span>
                 </div>
-              ))}
-            </div>
-          )
-        ) : (
-          <div>{renderTree(tree)}</div>
-        )}
-      </div>
+
+                {/* BUTTON GROUP */}
+                <div className="flex gap-2 mt-3">
+                  {STATUSES.map((s) => (
+                    <button
+                      key={s}
+                      onClick={() => updateStatus(node.id, s)}
+                      className={`px-3 py-1 text-xs rounded-md border transition-all duration-150 capitalize ${
+                        status === s
+                          ? s === "known"
+                            ? "bg-emerald-500/20 text-emerald-300 border-emerald-500"
+                            : s === "partial"
+                              ? "bg-amber-500/20 text-amber-300 border-amber-500"
+                              : "bg-slate-700 text-slate-300 border-slate-500"
+                          : "bg-transparent text-slate-500 border-slate-700 hover:border-slate-500"
+                      }`}
+                    >
+                      {s}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {viewMode === "tree" && renderTree(buildTree())}
+
+      {viewMode === "graph" && (
+        <div className="flex-1 w-full">
+          <ReactFlow
+            nodes={graphNodes}
+            edges={graphEdges}
+            fitView
+            className="bg-[#020617]"
+          >
+            <Background />
+            <Controls />
+          </ReactFlow>
+        </div>
+      )}
     </div>
   );
 };

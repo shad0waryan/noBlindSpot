@@ -9,7 +9,7 @@
     "dev": "nodemon index.js"
   },
   "dependencies": {
-    "@google/generative-ai": "^0.21.0",
+    "axios": "^1.13.6",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",

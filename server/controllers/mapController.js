@@ -1,10 +1,10 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
 import { v4 as uuidv4 } from "uuid";
 import TopicMap from "../models/TopicMap.js";
 import UserProgress from "../models/UserProgress.js";
+import axios from "axios";
+import { OPENROUTER_API_KEY } from "../config/env.js";
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-
+// ================= PROMPT =================
 const buildKnowledgeMapPrompt = (topic) => `
 You are an expert educator and curriculum designer. Topic: "${topic}"
 
@@ -30,6 +30,7 @@ Format:
 ]
 `;
 
+// ================= VALIDATION =================
 function validateTree(nodes) {
   const ids = new Set();
   const parentIds = new Set();
@@ -72,7 +73,7 @@ export const generateMap = async (req, res, next) => {
 
     let topicMap = await TopicMap.findOne({ topic: normalizedTopic });
 
-    // ===== CACHE =====
+    // ===== CACHE HIT =====
     if (topicMap) {
       let progress = await UserProgress.findOne({
         user: req.user._id,
@@ -97,14 +98,29 @@ export const generateMap = async (req, res, next) => {
     }
 
     // ===== AI CALL =====
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-
-    const result = await model.generateContent(
-      buildKnowledgeMapPrompt(normalizedTopic),
+    const response = await axios.post(
+      "https://openrouter.ai/api/v1/chat/completions",
+      {
+        model: "openrouter/free", // ✅ FREE MODEL
+        messages: [
+          {
+            role: "user",
+            content: buildKnowledgeMapPrompt(normalizedTopic),
+          },
+        ],
+        temperature: 0.3,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+      }
     );
 
-    const rawText = result.response.text().trim();
+    const rawText = response.data.choices[0].message.content.trim();
 
+    // ===== PARSE =====
     let nodes;
     try {
       nodes = JSON.parse(rawText);
@@ -116,7 +132,6 @@ export const generateMap = async (req, res, next) => {
       nodes = JSON.parse(match[0]);
     }
 
-    // 🔴 prevent empty response
     if (!Array.isArray(nodes) || nodes.length === 0) {
       return res.status(500).json({ message: "AI returned empty map" });
     }
@@ -131,12 +146,21 @@ export const generateMap = async (req, res, next) => {
 
     validateTree(sanitizedNodes);
 
-    // ===== SAVE MAP =====
-    topicMap = await TopicMap.create({
-      topic: normalizedTopic,
-      nodes: sanitizedNodes,
-    });
+    // ===== SAFE CREATE (HANDLE DUPLICATE) =====
+    try {
+      topicMap = await TopicMap.create({
+        topic: normalizedTopic,
+        nodes: sanitizedNodes,
+      });
+    } catch (err) {
+      if (err.code === 11000) {
+        topicMap = await TopicMap.findOne({ topic: normalizedTopic });
+      } else {
+        throw err;
+      }
+    }
 
+    // ===== CREATE USER PROGRESS =====
     const progress = await UserProgress.create({
       user: req.user._id,
       topicMap: topicMap._id,
